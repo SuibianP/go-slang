@@ -527,6 +527,7 @@ function FUNCTION_CALL() {
       // D is now address where last argument goes in new env
       for (C = D; C > D - G; C = C - 1) {
         POP_OS() // now RES has the address of the next arg
+        if (RES == undefined) throw new Error('Operand is undefined')
         HEAP[C] = RES // copy argument into new env
       }
     } else {
@@ -1087,7 +1088,8 @@ M[OpCodes.NEQG] = () => {
 }
 
 M[OpCodes.NEWC] = () => {
-  A = (P[PC][NEWC_ADDR_OFFSET] as Address)[ADDR_FUNC_INDEX_OFFSET]
+  A = (P[PC][NEWC_ADDR_OFFSET] as Address)[ADDR_FUNC_INDEX_OFFSET] ?? P[PC][NEWC_ADDR_OFFSET]
+  if (A === undefined) throw new Error()
   B = CLOSURE_NORMAL_TYPE
   NEW_FUNCTION()
   A = RES
@@ -1111,6 +1113,7 @@ M[OpCodes.LDLG] = () => {
 
 M[OpCodes.STLG] = () => {
   POP_OS()
+  if (RES === undefined) throw new Error('STLG stores undefined')
   C = ENV
   HEAP[C + HEAP[C + FIRST_CHILD_SLOT] + P[PC][LD_ST_INDEX_OFFSET]] = RES
   PC = PC + 1
@@ -1123,6 +1126,7 @@ M[OpCodes.LDPG] = () => {
     C = HEAP[C + PREVIOUS_ENV_SLOT]
   }
   A = HEAP[C + HEAP[C + FIRST_CHILD_SLOT] + P[PC][LD_ST_INDEX_OFFSET]]
+  if (A === undefined) throw new Error('LDPG gets undefined')
   PUSH_OS()
   PC = PC + 1
 }
