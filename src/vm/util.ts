@@ -151,7 +151,11 @@ const OPCODES_STR = {
   // Concurrency Opcodes
   [OpCodes.EXECUTE]: 'EXEC  ',
   [OpCodes.TEST_AND_SET]: 'T&S   ',
-  [OpCodes.CLEAR]: 'CLEAR '
+  [OpCodes.CLEAR]: 'CLEAR ',
+
+  [OpCodes.LGCC]: 'LGCC ',
+  [OpCodes.GO]: 'GO',
+  [OpCodes.CHAN]: 'CHAN '
 }
 
 // get name of opcode for debugging

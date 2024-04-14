@@ -3,16 +3,21 @@ import { Program, SVMFunction } from '../vm/svml-compiler'
 import { assemble } from '../vm/svml-assembler'
 import { runWithProgram } from '../vm/svml-machine'
 import createContext from '../createContext'
-import OpCodes from '../vm/opcodes'
+import { OpCodes } from '../vm/opcodes'
 import { stringifyProgram } from '../vm/util'
 import GoParser, {
+  AssignmentContext,
+  BlockContext,
   ExpressionContext,
+  ForStmtContext,
   FunctionDeclContext,
   FunctionLitContext,
+  IfStmtContext,
   IntegerContext,
   OperandContext,
   OperandNameContext,
   PrimaryExprContext,
+  SendStmtContext,
   SourceFileContext,
   String_Context,
   VarSpecContext
@@ -32,12 +37,15 @@ declare module './generated/GoParser' {
   export interface SourceFileContext {
     env: string[] // index is in table
   }
+
+  export interface IfStmtContext {
+    env: string[] // index is in table
+  }
 }
 
 declare module 'antlr4' {
   export interface RuleContext {
     getSym(sym: string): [index: number, envDiff: number]
-
     allocSym(sym: string): number
   }
 }
@@ -52,14 +60,16 @@ const nextCtx = (
       ctx instanceof SourceFileContext
     )
   ) {
-    if (!ctx.parentCtx) {
-      throw new Error('No parent')
+    if (!ctx?.parentCtx) {
+      throw new Error(`No parent`)
     } else {
       ctx = ctx.parentCtx
     }
   }
   return ctx
 }
+
+// TODO NEWENV POPENV
 
 RuleContext.prototype.getSym = function (sym: string): [index: number, envDiff: number] {
   // return ctx if current ctx is already
@@ -93,14 +103,17 @@ FunctionDeclContext.prototype.constructor = envConsFac(FunctionDeclContext.proto
 // function: compile function, load onto stack, if named get slot and store in symbol map
 
 class GolangFuncVisitor extends GoParserVisitor<SVMFunction | null> {
-  readonly EMPTY_FUNC: SVMFunction = [0, 0, 0, []]
+  get EMPTY_FUNC(): SVMFunction {
+    return [0, 0, 0, []]
+  }
+
   // map from SVMFunction object to global addr
   funcs: SVMFunction[] = [] // index is global addr
 
   // we need this function: visit(ctx, instr, ctx, ...)
 
-  visitVarSpec = (ctx: VarSpecContext) => {
-    const init_expr = ctx.expressionList().expression_list()
+  visitVarSpec = (ctx: VarSpecContext): SVMFunction => {
+    const init_expr = ctx.expressionList()?.expression_list()
     // for each of the identifier, allocate a slot, LGC the init value and STL to it
     const funcs = ctx
       .identifierList()
@@ -108,7 +121,7 @@ class GolangFuncVisitor extends GoParserVisitor<SVMFunction | null> {
       .map((ident, index): SVMFunction => {
         const name = ident.getText()
         const idx = ctx.allocSym(name)
-        if (init_expr[index]) {
+        if (init_expr?.[index]) {
           let expr_ins = this.visit(init_expr[index])
           expr_ins[3].push([OpCodes.STLG, idx])
           return expr_ins
@@ -118,10 +131,25 @@ class GolangFuncVisitor extends GoParserVisitor<SVMFunction | null> {
     return this.combineSVMFunctions(...funcs)
   }
 
-  // use the name if named function, otherwise
-  visitFunctionDecl = (ctx: FunctionDeclContext): SVMFunction => {
+  visitIfStmt = (ctx: IfStmtContext) => {
+    const pred = this.visit([ctx.simpleStmt(), ctx.expression()])
+    const cons = this.visit(ctx.block(0))
+    const alt = this.visit(ctx.block(1))
+    if (!alt)
+      return this.combineSVMFunctions(pred, [0, 0, 0, [[OpCodes.BRF, cons[3].length + 1]]], cons)
+    // pred, BRF Alt, cons, BR End, Alt: alt, End:
+    return this.combineSVMFunctions(
+      pred,
+      [0, 0, 0, [[OpCodes.BRF, cons[3].length + 2]]],
+      cons,
+      [0, 0, 0, [[OpCodes.BR, alt[3].length + 1]]],
+      alt
+    )
+  }
+
+  visitFunctionLit = (ctx: FunctionLitContext): SVMFunction => {
     // NEWC <addr> and STLG <slot> bind function literal to the name
-    const name = ctx.IDENTIFIER().getText()
+    ctx.env ??= []
     let arg_cnt = 0
     ctx
       .signature()
@@ -130,26 +158,24 @@ class GolangFuncVisitor extends GoParserVisitor<SVMFunction | null> {
       .forEach(p =>
         p
           .identifierList()
-          .IDENTIFIER_list()
-          .forEach(i => ctx.allocSym(i.getText()), arg_cnt++)
+          ?.IDENTIFIER_list()
+          ?.forEach(i => ctx.allocSym(i.getText()), arg_cnt++)
       )
-    const idx = ctx.parentCtx!.allocSym(name) // index in symbol table in parent
     let blk = this.visit(ctx.block()) // visit the body
     blk[0] = 20
-    blk[1] = 20
+    blk[1] = ctx.env.length
     blk[2] = arg_cnt
     blk[3].push([OpCodes.RETG])
     const addr = this.funcs.length
     this.funcs.push(blk)
-    return [
-      0,
-      0,
-      arg_cnt,
-      [
-        [OpCodes.NEWC, addr],
-        [OpCodes.STLG, idx]
-      ]
-    ]
+    return [0, 0, 0, [[OpCodes.NEWC, addr]]]
+  }
+
+  // use the name if named function, otherwise
+  visitFunctionDecl = (ctx: FunctionDeclContext): SVMFunction => {
+    const l = this.visitFunctionLit(ctx)
+    l[3].push([OpCodes.STLG, ctx.parentCtx!.allocSym(ctx.IDENTIFIER().getText())])
+    return l
   }
 
   visitOperand = (ctx: OperandContext): SVMFunction | null => {
@@ -158,8 +184,9 @@ class GolangFuncVisitor extends GoParserVisitor<SVMFunction | null> {
       ctx.parentCtx.parentCtx instanceof PrimaryExprContext &&
       ctx.parentCtx.parentCtx.arguments()
     ) {
-      // this operand is called
-      const name = ctx.operandName().getText()
+      // this operand is called, may be function literal or variable
+      const name = ctx.operandName()?.getText()
+      if (!name) return this.visit(ctx.literal())
       if (name === 'display') {
         // T: tail; P: primitive V: internal
         // for now
@@ -179,28 +206,42 @@ class GolangFuncVisitor extends GoParserVisitor<SVMFunction | null> {
     return this.visitChildren(ctx)
   }
 
-  visitPrimaryExpr = (ctx: PrimaryExprContext) => {
+  visitPrimaryExpr = (ctx: PrimaryExprContext): SVMFunction => {
     // first check if
-    if (ctx.arguments()) {
+    const name = ctx.primaryExpr()?.operand()?.operandName()?.getText()
+    if (ctx.arguments()?.expressionList()) {
       // function call
-      // TODO combine the two and return
       let res = this.visit([ctx.primaryExpr(), ctx.arguments()]) // push function first
-      if (ctx.primaryExpr()?.operand().operandName().getText() === 'display') {
+      if (name === 'display') {
         res[3].push([OpCodes.DISPLAY])
       } else {
-        res[3].push([OpCodes.CALL, ctx.arguments().expressionList().expression_list().length])
+        res[3].push([OpCodes.CALL, ctx.arguments().expressionList()?.expression_list().length ?? 0])
       }
       return res
+    } else if (name === 'make') {
+      // make(chan something)
+      if (!ctx?.arguments()?.type_()?.typeLit()?.channelType()) {
+        throw new Error('make for non channel type')
+      }
+      return [0, 0, 0, [[OpCodes.LGCC]]]
     } else {
-      return this.visitChildren(ctx)
+      // not invocation
+      return this.visitChildren(ctx)!
     }
+  }
+
+  visitSendStmt = (ctx: SendStmtContext): SVMFunction => {
+    let ins = this.visit(ctx.expression_list())
+    ins[3].push([OpCodes.CHAN, 0])
+    return ins
   }
 
   visitExpression = (ctx: ExpressionContext) => {
     // TODO eval the operands first then the operator
     const UN_OP_MAP = new Map<number, OpCodes>([
       [GoLexer.EXCLAMATION, OpCodes.NOTG],
-      [GoLexer.MINUS, OpCodes.NEGG]
+      [GoLexer.MINUS, OpCodes.NEGG],
+      [GoLexer.RECEIVE, OpCodes.CHAN]
     ])
     const BIN_OP_MAP = new Map<number, OpCodes>([
       [GoLexer.MINUS, OpCodes.SUBG],
@@ -216,19 +257,21 @@ class GolangFuncVisitor extends GoParserVisitor<SVMFunction | null> {
       [GoLexer.EQUALS, OpCodes.EQG],
       [GoLexer.NOT_EQUALS, OpCodes.NEQG]
     ])
+    let res: SVMFunction
     const un_op = ctx._unary_op
     const bi_op = ctx._mul_op ?? ctx._add_op ?? ctx._rel_op ?? ctx.LOGICAL_AND() ?? ctx.LOGICAL_OR()
     const op = un_op ?? bi_op
     let opc: OpCodes | undefined
     if (op) {
-      let res = this.visit(ctx.expression_list())
+      res = this.visit(ctx.expression_list())
       opc = (un_op ? UN_OP_MAP : BIN_OP_MAP).get(op.type)
       if (opc === undefined) throw new Error(`Unsupported operator ${op}`)
-      res[3].push([opc])
-      return res
+      res[3].push(opc === OpCodes.CHAN ? [opc, 1] : [opc])
     } else {
-      return this.visit(ctx.primaryExpr())
+      res = this.visit(ctx.primaryExpr())
     }
+    if (ctx.parentCtx instanceof BlockContext) res[3].push([OpCodes.POPG])
+    return res
   }
 
   visitInteger = (ctx: IntegerContext): SVMFunction => {
@@ -260,10 +303,36 @@ class GolangFuncVisitor extends GoParserVisitor<SVMFunction | null> {
     return [0, 0, 0, [[OpCodes.LDPG, ...ctx.getSym(ident)]]]
   }
 
+  visitForStmt = (ctx: ForStmtContext): SVMFunction => {
+    // cond, BRF, body, BR
+    let cond = this.visit(ctx.expression() ?? ctx.forClause())
+    let body = this.visit(ctx.block())
+    return this.combineSVMFunctions(cond, [0, 0, 0, [[OpCodes.BRF, body[3].length + 2]]], body, [
+      0,
+      0,
+      0,
+      [[OpCodes.BR, -body.length - cond.length - 3]]
+    ])
+  }
+
+  visitAssignment = (ctx: AssignmentContext): SVMFunction => {
+    const lhs = ctx.expressionList(0).expression_list() // lhs
+    const rhs = ctx.expressionList(1).expression_list() // rhs
+    return rhs.reduce(
+      (prev, curr, idx) => {
+        let ins = this.visitExpression(curr)
+        ins[3].push([OpCodes.STPG, ...ctx.getSym(lhs[idx].getText())])
+        return this.combineSVMFunctions(prev, ins)
+      },
+      [...this.EMPTY_FUNC]
+    )
+  }
+
   visitSourceFile = (ctx: SourceFileContext) => {
+    ctx.env ??= []
     const glbl = this.visitChildren(ctx)!
     glbl[0] = 20 // TODO
-    glbl[1] = 20
+    glbl[1] = ctx.env.length
     glbl[2] = 0 // no args
     glbl[3].push([OpCodes.LDLG, ctx.getSym('main')[0]], [OpCodes.CALL, 0], [OpCodes.RETG])
     this.funcs.push(glbl)
@@ -282,15 +351,9 @@ class GolangFuncVisitor extends GoParserVisitor<SVMFunction | null> {
       const res = tree.map(i => this.visit(i)).filter(i => i ?? null)
       return this.combineSVMFunctions(...res) // empty scenario is handled inside
     } else {
-      return (tree as any).accept(this)
+      return (tree as any)?.accept(this)
     }
   }
-
-  // if a node returns a list of functions, all functions except for the first is to be propagated
-  // a node will never return a list of children results. either SVMFunction[] or undefined
-  // for childrens, flatten the propagation part and aggregate the firsts
-  // assignment of func literal to identifier is done at the varspec level
-  // (visit expression, get a function declaration and obtain its index, assign it to the variable slot)
 
   protected combineSVMFunctions(...funcs: SVMFunction[]): SVMFunction {
     return funcs.reduce(
@@ -311,19 +374,49 @@ export function compile(program: SourceFileContext): Program {
   return [visitor.funcs.length - 1, visitor.funcs]
 }
 
-const input = `
+let input = `
 package main
+
+var v = "global var"
+
 func another(str string) {
     var s string = "world"
-    display(str + ", " + s, "")
+    var yet = func (what string) {
+        return what + "sss" + s + str
+    }
+    s = "world2"
+    return yet
 }
+
 func main() {
-    display("hello?", "eh")
-    var h = "hello"
-    var i = -3 + 12 * 17
-    another(h)
+  display(another(v + "2")(v), "PPP")
 }
 `
+
+input = `
+package main
+func main() {
+    var v string = "?"
+    var i = 5
+    1 + 2 - 3
+    if i = -1; i > 0 {
+      display(i, "")
+      i = i - 1
+    }
+}
+`
+
+input = `
+package main
+func main() {
+  var c = make(chan string)
+  go func (c chan string) {
+    c <- "str"
+  }(c)
+  <-c
+}
+`
+
 const chars = new CharStream(input) // replace this with a FileStream as required
 const lexer = new GoLexer(chars)
 const tokens = new CommonTokenStream(lexer)

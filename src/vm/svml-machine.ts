@@ -213,6 +213,20 @@ function NEW_BOOL() {
   HEAP[RES + BOOL_VALUE_SLOT] = C
 }
 
+let CHANNEL_ID = 0 // new global state reg
+const CHANNEL_TAG = -110
+const CHANNEL_SIZE = 5
+const CHANNEL_VALUE_SLOT = 4
+// the payload is the global channel ID
+function NEW_CHANNEL() {
+  A = CHANNEL_TAG
+  B = CHANNEL_SIZE
+  NEW()
+  HEAP[RES + FIRST_CHILD_SLOT] = 6
+  HEAP[RES + LAST_CHILD_SLOT] = 5 // no children
+  HEAP[RES + CHANNEL_VALUE_SLOT] = CHANNEL_ID++
+}
+
 // string nodes layout
 //
 // 0: tag  = -107
@@ -1631,6 +1645,32 @@ M[OpCodes.CLEAR] = () => {
     NEW_BOOL()
     HEAP[D + ARRAY_VALUE_SLOT][0] = RES
   }
+}
+
+M[OpCodes.GO] = () => {
+  // TODO create goroutine
+  // function is on stack
+  POP_OS()
+  // function is now in RES
+  PC = PC + 1
+}
+
+M[OpCodes.LGCC] = () => {
+  NEW_CHANNEL()
+  A = RES
+  PUSH_OS()
+  PC = PC + 1
+}
+
+M[OpCodes.CHAN] = () => {
+  // TODO channel I/O, arg is in A, channel is on stack
+  // A: truthy for READ, falsy for WRITE
+  POP_OS()
+  B = RES
+  // channel id is PC[B][CHAN_VALUE_SLOT]
+  // TODO send/recv from the specified channel, block as needed
+  // ref M[OpCodes.EXECUTE]
+  PC = PC + 1
 }
 
 // called whenever the machine is first run

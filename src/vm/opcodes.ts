@@ -144,7 +144,12 @@ export enum OpCodes {
   // Source 3 Concurrenct Opcodes
   EXECUTE = 2000,
   TEST_AND_SET = 2001,
-  CLEAR = 2002
+  CLEAR = 2002,
+
+  // Go
+  LGCC, // create channel
+  GO, // create goroutine
+  CHAN // I/O on channel
 }
 
 export const OPCODE_MAX = 84
