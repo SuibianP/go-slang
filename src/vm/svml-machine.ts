@@ -43,6 +43,7 @@ const ADDR_FUNC_INDEX_OFFSET = 0
 const NEWENV_NUM_ARGS_OFFSET = 1
 const NEWCP_ID_OFFSET = 1
 const NEWCV_ID_OFFSET = 1
+const CHAN_DIR_OFFSET = 1 // for channel I/O
 
 // VIRTUAL MACHINE
 
@@ -1662,15 +1663,39 @@ M[OpCodes.LGCC] = () => {
   PC = PC + 1
 }
 
+let WOKEN = false
+
+// channel id in A, direction in B
+// value on current OS, RES is 0 if succeed and 1 if blocked
+function TRY_IO() {
+  // TODO traverse map to find the pair
+  // if found, set its WOKEN reg, operate on both OS, and put it into the ready queue
+  // otherwise, put current thread into map and sleep
+  RES = 1
+}
+
 M[OpCodes.CHAN] = () => {
-  // TODO channel I/O, arg is in A, channel is on stack
-  // A: truthy for READ, falsy for WRITE
-  POP_OS()
-  B = RES
-  // channel id is PC[B][CHAN_VALUE_SLOT]
-  // TODO send/recv from the specified channel, block as needed
-  // ref M[OpCodes.EXECUTE]
-  PC = PC + 1
+  // truthy for READ, falsy for WRITE
+  // no need to save WOKEN, it is set when waking up
+  if (WOKEN) {
+    // we have just been woken up
+    // already on OS if read and already taken from OS if write
+    WOKEN = false
+    PC = PC + 1
+  } else {
+    A = HEAP[RES + CHANNEL_VALUE_SLOT] // channel id
+    B = P[PC][CHAN_DIR_OFFSET] // R/W
+    TRY_IO()
+    if (RES) {
+      // block, put to sleep and append to chan-thread map
+      // don't increment PC
+      PAUSE_THREAD()
+      RUN_THREAD()
+    } else {
+      // already finished operation on OS, nothing to do
+      PC = PC + 1
+    }
+  }
 }
 
 // called whenever the machine is first run
