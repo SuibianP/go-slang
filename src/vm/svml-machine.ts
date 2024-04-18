@@ -1,3 +1,4 @@
+import * as inspector from 'node:inspector'
 import { JSSLANG_PROPERTIES } from '../constants'
 import { PotentialInfiniteLoopError } from '../errors/timeoutErrors'
 import {
@@ -13,7 +14,7 @@ import { locationDummyNode } from '../utils/ast/astCreator'
 import { stringify } from '../utils/stringify'
 import OpCodes from './opcodes'
 import { Address, Instruction, Program, SVMFunction } from './svml-compiler'
-import { RoundRobinScheduler, Scheduler, ThreadId } from './svml-scheduler'
+import { BlockRoundRobinScheduler, ThreadId } from './svml-scheduler'
 import { getName } from './util'
 
 const LDCI_VALUE_OFFSET = 1
@@ -44,6 +45,7 @@ const NEWENV_NUM_ARGS_OFFSET = 1
 const NEWCP_ID_OFFSET = 1
 const NEWCV_ID_OFFSET = 1
 const CHAN_DIR_OFFSET = 1 // for channel I/O
+const GO_NUM_ARGS_OFFSET = 1
 
 // VIRTUAL MACHINE
 
@@ -225,7 +227,7 @@ function NEW_CHANNEL() {
   NEW()
   HEAP[RES + FIRST_CHILD_SLOT] = 6
   HEAP[RES + LAST_CHILD_SLOT] = 5 // no children
-  HEAP[RES + CHANNEL_VALUE_SLOT] = CHANNEL_ID++
+  HEAP[RES + CHANNEL_VALUE_SLOT] = ++CHANNEL_ID
 }
 
 // string nodes layout
@@ -607,16 +609,18 @@ type Thread = [
   number, // PC
   Instruction[], // P
   any[], // RTS
-  number // TOP_RTS
+  number, // TOP_RTS
+  boolean
 ]
 
-let scheduler: Scheduler = new RoundRobinScheduler()
+// let scheduler: Scheduler = new RoundRobinScheduler()
+let scheduler = new BlockRoundRobinScheduler()
 const threads: Map<ThreadId, Thread> = new Map()
 let currentThreadId: ThreadId = -1
 
 // Initialize the scheduler (do this before running code)
 function INIT_SCHEDULER() {
-  scheduler = new RoundRobinScheduler()
+  scheduler = new BlockRoundRobinScheduler()
   threads.clear()
 }
 
@@ -625,7 +629,7 @@ function INIT_SCHEDULER() {
 // after calling this, as the current thread state should not be running
 function NEW_THREAD() {
   const newId = scheduler.newThread()
-  threads.set(newId, [OS, ENV, PC, P, RTS, TOP_RTS])
+  threads.set(newId, [OS, ENV, PC, P, RTS, TOP_RTS, WOKEN])
 }
 
 // Schedule current thread for later execution
@@ -633,7 +637,7 @@ function NEW_THREAD() {
 // after calling this, as the current thread state should not be running
 function PAUSE_THREAD() {
   // Save state to threads map
-  threads.set(currentThreadId, [OS, ENV, PC, P, RTS, TOP_RTS])
+  threads.set(currentThreadId, [OS, ENV, PC, P, RTS, TOP_RTS, WOKEN])
 
   // Pause thread in scheduler
   scheduler.pauseThread(currentThreadId)
@@ -650,10 +654,12 @@ function DELETE_CURRENT_THREAD() {
 
 // Get thread from scheduler and run it
 function RUN_THREAD() {
-  ;[currentThreadId, TO] = scheduler.runThread()!
+  const t = scheduler.runThread()
+  if (t === null) throw new Error('No available thread to run, dead block?')
+  ;[currentThreadId, TO] = t
 
   // Load thread state
-  ;[OS, ENV, PC, P, RTS, TOP_RTS] = threads.get(currentThreadId)!
+  ;[OS, ENV, PC, P, RTS, TOP_RTS, WOKEN] = threads.get(currentThreadId)!
 }
 
 // Returns the number of threads in the scheduler
@@ -1582,31 +1588,47 @@ addPrimitiveOpCodeHandlers()
 // All internal functions should not use register J or K, and can find
 // the number of arguments in G. They should also not increment PC.
 
+// saved OS in E
+function POP_SPAWN() {
+  RTS = []
+  TOP_RTS = -1
+  OS = E
+  I = C
+  POP_OS()
+  H = RES // store closure in H
+  F = HEAP[H + CLOSURE_FUNC_INDEX_SLOT]
+  F = FUNC[F] // store function header in F
+  A = F[FUNC_MAX_STACK_SIZE_OFFSET]
+  const oldOS = E
+  NEW_OS()
+  const newOS = RES
+  OS = RES
+  A = F[FUNC_ENV_SIZE_OFFSET]
+  B = HEAP[H + CLOSURE_ENV_SLOT]
+  NEW_ENVIRONMENT()
+  ENV = RES
+  D = ENV + HEAP[ENV + FIRST_CHILD_SLOT] + C - 1
+  OS = oldOS
+  for (A = D; A > D - I; --A) {
+    POP_OS()
+    HEAP[A] = RES
+  }
+  OS = newOS
+  P = F[FUNC_CODE_OFFSET]
+  // enqueue to thread queue
+  PC = 0
+  NEW_THREAD()
+}
+
 // expects num args in G
 M[OpCodes.EXECUTE] = () => {
   I = G
   E = OS // we need the values in OS, so store in E first
   G = [OS, ENV, PC, P, RTS, TOP_RTS] // store current state first
   // Keep track of registers first to restore present state after saving threads
+  C = 0
   for (; I > 0; I = I - 1) {
-    RTS = []
-    TOP_RTS = -1
-    OS = E
-    POP_OS()
-    H = RES // store closure in H
-    F = HEAP[H + CLOSURE_FUNC_INDEX_SLOT]
-    F = FUNC[F] // store function header in F
-    A = F[FUNC_MAX_STACK_SIZE_OFFSET]
-    NEW_OS()
-    OS = RES
-    A = F[FUNC_ENV_SIZE_OFFSET]
-    B = HEAP[H + CLOSURE_ENV_SLOT]
-    NEW_ENVIRONMENT()
-    ENV = RES
-    P = F[FUNC_CODE_OFFSET]
-    // enqueue to thread queue
-    PC = 0
-    NEW_THREAD()
+    POP_SPAWN()
   }
   ;[OS, ENV, PC, P, RTS, TOP_RTS] = G // restore state
 }
@@ -1649,10 +1671,11 @@ M[OpCodes.CLEAR] = () => {
 }
 
 M[OpCodes.GO] = () => {
-  // TODO create goroutine
-  // function is on stack
-  POP_OS()
-  // function is now in RES
+  E = OS // we need the values in OS, so store in E first
+  C = P[PC][GO_NUM_ARGS_OFFSET] // num of args
+  G = [OS, ENV, PC, P, RTS, TOP_RTS] // store current state first
+  POP_SPAWN()
+  ;[OS, ENV, PC, P, RTS, TOP_RTS] = G // restore state
   PC = PC + 1
 }
 
@@ -1663,33 +1686,82 @@ M[OpCodes.LGCC] = () => {
   PC = PC + 1
 }
 
+// positive for read, negative for write
+const blockMap: Map<number, ThreadId[]> = new Map()
+
 let WOKEN = false
 
 // channel id in A, direction in B
 // value on current OS, RES is 0 if succeed and 1 if blocked
+// changes sleeping thread status but does not run nor touch current thread
 function TRY_IO() {
-  // TODO traverse map to find the pair
   // if found, set its WOKEN reg, operate on both OS, and put it into the ready queue
   // otherwise, put current thread into map and sleep
-  RES = 1
+  const threadIds = blockMap.get(-C)
+  if (threadIds !== undefined && threadIds.length !== 0) {
+    const threadId = threadIds.shift()!
+    UNBLOCK_THREAD(threadId) // put to idle
+    let savedState = threads.get(threadId)!
+    // do IO
+    if (B) {
+      // current thread is read
+      const oldOS = OS
+      OS = savedState[0]
+      POP_OS()
+      A = RES
+      OS = oldOS
+      PUSH_OS()
+    } else {
+      // current thread is write
+      POP_OS()
+      A = RES
+      const oldOS = OS
+      OS = savedState[0]
+      PUSH_OS()
+      OS = oldOS
+    }
+    savedState[6] = true // for the sleeping thread
+    // WOKEN = true // do not for the current thread if it is not blocking
+    RES = 0
+  } else {
+    RES = 1
+  }
+}
+
+// channel ID in A, direction in B
+function BLOCK_THREAD() {
+  const val = blockMap.get(C)
+  if (val) {
+    val.push(currentThreadId)
+  } else {
+    blockMap.set(C, [currentThreadId])
+  }
+  threads.set(currentThreadId, [OS, ENV, PC, P, RTS, TOP_RTS, WOKEN])
+  scheduler.blockThread(currentThreadId)
+}
+
+// unblock thread and move to idle
+function UNBLOCK_THREAD(threadId: number) {
+  scheduler.unblockThread(threadId)
 }
 
 M[OpCodes.CHAN] = () => {
   // truthy for READ, falsy for WRITE
-  // no need to save WOKEN, it is set when waking up
   if (WOKEN) {
     // we have just been woken up
     // already on OS if read and already taken from OS if write
     WOKEN = false
     PC = PC + 1
   } else {
+    POP_OS() // channel
     A = HEAP[RES + CHANNEL_VALUE_SLOT] // channel id
     B = P[PC][CHAN_DIR_OFFSET] // R/W
+    C = A * (B ? 1 : -1)
     TRY_IO()
     if (RES) {
-      // block, put to sleep and append to chan-thread map
+      // blocked already
       // don't increment PC
-      PAUSE_THREAD()
+      BLOCK_THREAD()
       RUN_THREAD()
     } else {
       // already finished operation on OS, nothing to do
@@ -1751,14 +1823,14 @@ function run(): any {
 
   while (RUNNING) {
     // infinite loop protection
-    if (Date.now() - startTime > MAX_TIME) {
+    if (Date.now() - startTime > MAX_TIME && inspector.url() === undefined) {
       throw new PotentialInfiniteLoopError(locationDummyNode(-1, -1, null), MAX_TIME)
     }
 
     if (TO > 0) {
       // show_registers("run loop");
       // show_heap("run loop");
-      // show_executing('')
+      console.log(show_executing(''))
       RUN_INSTRUCTION()
     } else if (TO === 0) {
       // when exhausted time quanta

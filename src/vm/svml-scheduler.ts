@@ -26,10 +26,10 @@ export interface Scheduler {
 }
 
 export class RoundRobinScheduler implements Scheduler {
-  private _currentThreads: Set<ThreadId> = new Set()
-  private _idleThreads: ThreadId[] = []
+  protected _currentThreads: Set<ThreadId> = new Set()
+  protected _idleThreads: ThreadId[] = []
   private _maxThreadId = -1
-  private _maxTimeQuanta: number = 15
+  protected _maxTimeQuanta: number = 15
 
   // Get number of currently executing threads
   numCurrent(): number {
@@ -77,5 +77,24 @@ export class RoundRobinScheduler implements Scheduler {
   pauseThread(id: ThreadId): void {
     this._currentThreads.delete(id)
     this._idleThreads.push(id)
+  }
+}
+
+export class BlockRoundRobinScheduler extends RoundRobinScheduler {
+  private _blockThreads: Set<ThreadId> = new Set()
+  // _maxTimeQuanta = Infinity
+
+  blockThread(id: number): void {
+    if (!this._currentThreads.delete(id)) throw new Error()
+    this._blockThreads.add(id)
+  }
+
+  unblockThread(id: ThreadId): void {
+    if (!this._blockThreads.delete(id)) throw new Error()
+    this._idleThreads.push(id)
+  }
+
+  numIdle(): number {
+    return this._idleThreads.length + this._blockThreads.size
   }
 }

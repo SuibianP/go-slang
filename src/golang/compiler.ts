@@ -12,6 +12,7 @@ import GoParser, {
   ForStmtContext,
   FunctionDeclContext,
   FunctionLitContext,
+  GoStmtContext,
   IfStmtContext,
   IntegerContext,
   OperandContext,
@@ -209,9 +210,13 @@ class GolangFuncVisitor extends GoParserVisitor<SVMFunction | null> {
   visitPrimaryExpr = (ctx: PrimaryExprContext): SVMFunction => {
     // first check if
     const name = ctx.primaryExpr()?.operand()?.operandName()?.getText()
-    if (ctx.arguments()?.expressionList()) {
+    if (ctx.arguments()?.expressionList() || ctx.arguments()?.getChildCount() == 2) {
       // function call
-      let res = this.visit([ctx.primaryExpr(), ctx.arguments()]) // push function first
+      let res = this.visit(
+        ctx?.parentCtx?.parentCtx instanceof GoStmtContext
+          ? [ctx.arguments(), ctx.primaryExpr()]
+          : [ctx.primaryExpr(), ctx.arguments()]
+      ) // push function first
       if (name === 'display') {
         res[3].push([OpCodes.DISPLAY])
       } else {
@@ -231,7 +236,7 @@ class GolangFuncVisitor extends GoParserVisitor<SVMFunction | null> {
   }
 
   visitSendStmt = (ctx: SendStmtContext): SVMFunction => {
-    let ins = this.visit(ctx.expression_list())
+    let ins = this.visit(ctx.expression_list().slice().reverse())
     ins[3].push([OpCodes.CHAN, 0])
     return ins
   }
@@ -301,6 +306,13 @@ class GolangFuncVisitor extends GoParserVisitor<SVMFunction | null> {
     // variable name used in expression
     const ident = ctx.IDENTIFIER().getText()
     return [0, 0, 0, [[OpCodes.LDPG, ...ctx.getSym(ident)]]]
+  }
+
+  visitGoStmt = (ctx: GoStmtContext): SVMFunction => {
+    let ret = this.visit(ctx.expression())
+    if (!ctx.expression()?.primaryExpr()?.arguments()) throw new Error('go statement not called')
+    ret[3][ret[3].length - 1][0] = OpCodes.GO
+    return ret
   }
 
   visitForStmt = (ctx: ForStmtContext): SVMFunction => {
@@ -408,12 +420,48 @@ func main() {
 
 input = `
 package main
+
+func main() {
+  var c1 = make(chan string)
+  var c2 = make(chan chan string)
+  go func () {
+    c2 <- c1
+  }()
+  go func () {
+    var c = <-c2
+    c <- "str"
+  }()
+  display(<-c1, "")
+}
+`
+
+input = `
+package main
+
+func main() {
+  var c1 = make(chan string)
+  var c2 = make(chan chan string)
+  go func (s string) {
+    c2 <- c1
+  }("sss")
+  go func () {
+    var c = <-c2
+    c <- "str"
+  }()
+  display(<-c1, "")
+}
+`
+
+input = `
+package main
+
 func main() {
   var c = make(chan string)
-  go func (c chan string) {
-    c <- "str"
-  }(c)
-  <-c
+  go func (s string) {
+    c <- s
+  }("sss")
+  
+  display(<-c, "")
 }
 `
 
