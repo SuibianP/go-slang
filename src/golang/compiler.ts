@@ -1,4 +1,4 @@
-import { CharStream, CommonTokenStream, ParseTree, RuleContext } from 'antlr4'
+import { CharStream, CommonTokenStream, FileStream, ParseTree, RuleContext } from 'antlr4'
 import { Program, SVMFunction } from '../vm/svml-compiler'
 import { assemble } from '../vm/svml-assembler'
 import { runWithProgram } from '../vm/svml-machine'
@@ -18,6 +18,7 @@ import GoParser, {
   OperandContext,
   OperandNameContext,
   PrimaryExprContext,
+  ReturnStmtContext,
   SendStmtContext,
   SourceFileContext,
   String_Context,
@@ -218,7 +219,7 @@ class GolangFuncVisitor extends GoParserVisitor<SVMFunction | null> {
           : [ctx.primaryExpr(), ctx.arguments()]
       ) // push function first
       if (name === 'display') {
-        res[3].push([OpCodes.DISPLAY])
+        res[3].push([OpCodes.DISPLAY], [OpCodes.POPG])
       } else {
         res[3].push([OpCodes.CALL, ctx.arguments().expressionList()?.expression_list().length ?? 0])
       }
@@ -323,7 +324,7 @@ class GolangFuncVisitor extends GoParserVisitor<SVMFunction | null> {
       0,
       0,
       0,
-      [[OpCodes.BR, -body.length - cond.length - 3]]
+      [[OpCodes.BR, 0 - body[3].length - cond[3].length - 1]]
     ])
   }
 
@@ -349,6 +350,12 @@ class GolangFuncVisitor extends GoParserVisitor<SVMFunction | null> {
     glbl[3].push([OpCodes.LDLG, ctx.getSym('main')[0]], [OpCodes.CALL, 0], [OpCodes.RETG])
     this.funcs.push(glbl)
     return null
+  }
+
+  visitReturnStmt = (ctx: ReturnStmtContext): SVMFunction => {
+    let res = this.visitChildren(ctx) ?? this.EMPTY_FUNC
+    res[3].push([OpCodes.RETG])
+    return res
   }
 
   visitChildren(node: any) {
@@ -389,84 +396,23 @@ export function compile(program: SourceFileContext): Program {
 let input = `
 package main
 
-var v = "global var"
+var i = 0;
 
-func another(str string) {
-    var s string = "world"
-    var yet = func (what string) {
-        return what + "sss" + s + str
-    }
-    s = "world2"
-    return yet
+func loop() {
+  for 1 {
+    i = i + 1
+    display(i, "")
+  }
 }
 
 func main() {
-  display(another(v + "2")(v), "PPP")
+  go loop()
+  go loop()
 }
 `
 
-input = `
-package main
-func main() {
-    var v string = "?"
-    var i = 5
-    1 + 2 - 3
-    if i = -1; i > 0 {
-      display(i, "")
-      i = i - 1
-    }
-}
-`
-
-input = `
-package main
-
-func main() {
-  var c1 = make(chan string)
-  var c2 = make(chan chan string)
-  go func () {
-    c2 <- c1
-  }()
-  go func () {
-    var c = <-c2
-    c <- "str"
-  }()
-  display(<-c1, "")
-}
-`
-
-input = `
-package main
-
-func main() {
-  var c1 = make(chan string)
-  var c2 = make(chan chan string)
-  go func (s string) {
-    c2 <- c1
-  }("sss")
-  go func () {
-    var c = <-c2
-    c <- "str"
-  }()
-  display(<-c1, "")
-}
-`
-
-input = `
-package main
-
-func main() {
-  var c = make(chan string)
-  go func (s string) {
-    c <- s
-  }("sss")
-  
-  display(<-c, "")
-}
-`
-
-const chars = new CharStream(input) // replace this with a FileStream as required
-const lexer = new GoLexer(chars)
+const stream = process.argv[2] ? new FileStream(process.argv[2]) : new CharStream(input)
+const lexer = new GoLexer(stream)
 const tokens = new CommonTokenStream(lexer)
 const parser = new GoParser(tokens)
 const tree = parser.sourceFile()

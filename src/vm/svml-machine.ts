@@ -1609,7 +1609,7 @@ function POP_SPAWN() {
   ENV = RES
   D = ENV + HEAP[ENV + FIRST_CHILD_SLOT] + C - 1
   OS = oldOS
-  for (A = D; A > D - I; --A) {
+  for (let i = D; i > D - I; --i) {
     POP_OS()
     HEAP[A] = RES
   }
@@ -1830,7 +1830,7 @@ function run(): any {
     if (TO > 0) {
       // show_registers("run loop");
       // show_heap("run loop");
-      console.log(show_executing(''))
+      // console.log(show_executing(''))
       RUN_INSTRUCTION()
     } else if (TO === 0) {
       // when exhausted time quanta
